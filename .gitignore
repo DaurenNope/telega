@@ -1,1 +1,22 @@
-src/credentials.json
+    # Environment variables
+    .env
+
+    # Telegram session file
+    *.session
+    *.session-journal
+
+    # Python cache
+    __pycache__/
+    *.pyc
+    *.pyo
+    *.pyd
+
+    # Virtual environment (if you use one)
+    venv/
+    env/
+    .venv/
+
+    # IDE specific files (optional, add based on your editor)
+    .vscode/
+    .idea/
+    credentials.json
