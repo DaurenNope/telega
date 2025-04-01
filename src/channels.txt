@@ -43,6 +43,6 @@ tomcapital
 
 # Regional channels
 blacktaraxacum
-claimzilla
+
 
 # Public username
