@@ -30,9 +30,12 @@ def send_telegram_notification(message: str):
         console.print("[yellow]NOTIFICATION_BOT_TOKEN or NOTIFICATION_CHAT_ID not set in .env, skipping notification.[/]")
         return
 
+    # Wrap the incoming message in a Markdown code block for safety
+    safe_message = f"```\n{message}\n```"
+
     payload = {
         'chat_id': chat_id,
-        'text': f"⚠️ Scraper Alert ⚠️\n\n{message}",
+        'text': f"⚠️ Scraper Alert ⚠️\n\n{safe_message}",
         'parse_mode': 'Markdown'
     }
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -54,18 +57,24 @@ def send_telegram_notification(message: str):
         if response_json.get("ok"):
             console.print("[green]Notification sent successfully via Bot API.[/]")
         else:
-            console.print(f"[red]Telegram Bot API returned an error: {response_json.get('description')}[/]")
+            # Ensure error description is also sent safely if possible
+            error_desc = response_json.get('description', 'Unknown API Error')
+            console.print(f"[red]Telegram Bot API returned an error: ```{error_desc}```[/]")
             
     except requests.exceptions.RequestException as req_err:
         console.print(f"[red]Failed to send Telegram notification (Request Error): {str(req_err)}[/]")
         if response is not None:
              console.print(f"[dim]Failed Response Status: {response.status_code}[/]")
-             console.print(f"[dim]Failed Response Body: {response.text}[/]")
+             # Send raw response text safely
+             safe_body = f"```\n{response.text}\n```"
+             console.print(f"[dim]Failed Response Body: {safe_body}[/]")
     except Exception as notify_err:
         console.print(f"[red]Failed to send Telegram notification (Other Error): {str(notify_err)}[/]")
         if response is not None:
              console.print(f"[dim]Error Response Status: {response.status_code}[/]")
-             console.print(f"[dim]Error Response Body: {response.text}[/]")
+             # Send raw response text safely
+             safe_body = f"```\n{response.text}\n```"
+             console.print(f"[dim]Error Response Body: {safe_body}[/]")
         
 # --- End Notification Helper ---
 
