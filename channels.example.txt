@@ -1,0 +1,5 @@
+# Add Telegram channel usernames or invite links here, one per line.
+# Example:
+# telegram
+# https://t.me/durov
+# @durovschat 

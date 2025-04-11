@@ -2,14 +2,18 @@ import asyncio
 import os
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 from rich.console import Console
 from rich.progress import Progress
 from dotenv import load_dotenv
 from telegram_client import TelegramScraper
-from google_sheets_client import GSheetClient
 from telethon import events
+from telethon.tl.types import Message
 import requests
+import time # Import time module
+
+# --- NEW: Import analyzer functions ---
+from .analyzer import init_analyzer, extract_message_data # Relative import
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +23,11 @@ logging.basicConfig(
 console = Console()
 
 CHANNELS_FILE = "channels.txt"
+
+# --- NEW: Define keys for environment variables ---
+TELEGRAM_API_ID_KEY = "TELEGRAM_API_ID"
+TELEGRAM_API_HASH_KEY = "TELEGRAM_API_HASH"
+TELEGRAM_SESSION_NAME_KEY = "TELEGRAM_SESSION_NAME" # e.g., "telegram_scraper"
 
 # --- Notification Helper ---
 def send_telegram_notification(message: str):
@@ -128,38 +137,23 @@ def clean_channels_file():
     console.print(f"[green]Cleaned {len(channels)} unique channels[/]")
 
 
-async def interactive_mode(tg_client: TelegramScraper, gs_client: GSheetClient):
-    """Interactive command-line interface"""
+async def interactive_mode(tg_client: TelegramScraper):
+    """Interactive command-line interface (GSheet options removed)"""
     while True:
         console.print("\n[bold cyan]Telegram Scraper Menu[/]", justify="center")
         console.print("1. Scrape channel history")
         console.print("2. Start real-time listener")
-        console.print("3. Test Google Sheets connection")
         console.print("4. Clean channel list")
-        console.print("5. Clean and Deduplicate Sheet")
         console.print("6. Exit")
 
-        choice = console.input("\n[bold]Enter your choice (1-6): [/]")
+        choice = console.input("\n[bold]Enter your choice (1-2, 4, 6): [/]")
 
         if choice == "1":
-            await handle_scrape_mode(tg_client, gs_client)
+            await handle_scrape_mode(tg_client)
         elif choice == "2":
-            # Test connection before starting listener
-            if gs_client.test_connection():
-                await handle_listen_mode(tg_client, gs_client)
-            else:
-                console.print("[red]Google Sheets connection test failed. Please check your settings.[/]")
-        elif choice == "3":
-            test_gsheets_connection(gs_client)
+            await handle_listen_mode(tg_client)
         elif choice == "4":
             clean_channels_file()
-        elif choice == "5":
-            # Add confirmation step for safety
-            confirm = console.input("[bold yellow]This will fetch all data, deduplicate, sort, and rewrite the sheet. Are you sure? (y/n): [/]").lower()
-            if confirm == 'y':
-                gs_client.deduplicate_and_rewrite_sheet()
-            else:
-                console.print("[yellow]Sheet cleanup cancelled.[/]")
         elif choice == "6":
             console.print("[yellow]Exiting...[/]")
             break
@@ -167,39 +161,33 @@ async def interactive_mode(tg_client: TelegramScraper, gs_client: GSheetClient):
             console.print("[red]Invalid choice! Please try again.[/]")
 
 
-async def handle_scrape_mode(tg_client: TelegramScraper, gs_client: GSheetClient):
-    """Updated scraping menu with global sorting and per-channel start dates."""
+async def handle_scrape_mode(tg_client: TelegramScraper):
+    """Updated scraping menu (GSheet options removed)"""
     console.print("\n[bold]Scraping Options:[/]")
     console.print("1. Scrape single channel")
     console.print("2. Scrape all saved channels")
     console.print("3. Inspect channel for problematic content")
     choice = console.input("Enter option (1-3): ")
 
-    # Test Google Sheets connection first
-    if not gs_client.test_connection():
-        console.print("[red]Google Sheets connection test failed. Check credentials/connection.[/]")
-        return
-
     if choice == "3":
         await inspect_channel_content(tg_client)
         return
 
-    # Get a *default* start date from the user (used if no channel-specific date found)
     default_start_date = get_default_start_date_from_user()
-    all_messages = []
+    all_scraped_messages_data: List[Dict] = [] # Store processed dicts now
 
     if choice == "1":
         channel = console.input("[bold]Enter channel username: [/]").strip()
-        # For single channel, find its specific start date
-        channel_start_date = gs_client.get_last_timestamp_for_channel(channel) or default_start_date
-        console.print(f"[dim]Using start date for {channel}: {channel_start_date}[/]")
-        messages = await scrape_single_channel(tg_client, channel, channel_start_date)
-        # If scraping one channel, just process it immediately
-        if messages:
-            added = gs_client.batch_append(messages)
-            console.print(f"[green]Total added: {added} messages from {channel}[/]")
-        else:
-            console.print(f"[yellow]No new messages found for {channel}.[/]")
+        start_date_for_channel = default_start_date
+        console.print(f"[dim]Using start date for {channel}: {start_date_for_channel}[/]")
+        # --- MODIFIED: Iterate async generator ---
+        try:
+             async for message_data in tg_client.scrape_history(channel, start_date_for_channel):
+                  if message_data: # scrape_history yields processed dicts or None
+                       all_scraped_messages_data.append(message_data)
+        except Exception as e:
+             console.print(f"[red]Error during scraping history for {channel}: {e}[/]")
+             logging.exception(f"Scrape history error for {channel}")
             
     elif choice == "2":
         channels = load_channels()
@@ -207,29 +195,30 @@ async def handle_scrape_mode(tg_client: TelegramScraper, gs_client: GSheetClient
             console.print("[yellow]No saved channels found![/]")
             return
             
-        # Ask for batch processing preference - BATCHING IS RECOMMENDED for efficiency
-        # Force batching for per-channel start date logic
-        # process_one_by_one = console.input("[bold]Process channels one by one? (y/n, default=n): [/]").strip().lower() == "y"
         console.print("[info]Processing all channels in batch mode for efficiency with per-channel start dates.[/]")
-        process_one_by_one = False # Force batch processing
+        process_one_by_one = False
         
         total_scraped_count = 0
         for channel in channels:
-            # Determine start date for *this* channel
-            channel_start_date = gs_client.get_last_timestamp_for_channel(channel) or default_start_date
-            console.print(f"[dim]Using start date for {channel}: {channel_start_date}[/]")
+            start_date_for_channel = default_start_date
+            console.print(f"[dim]Using start date for {channel}: {start_date_for_channel}[/]")
             
-            messages = await scrape_single_channel(tg_client, channel, channel_start_date)
-            all_messages.extend(messages)
-            total_scraped_count += len(messages)
-            # Optional: Add small sleep between channels if hitting rate limits
-            # await asyncio.sleep(1) 
+            # --- MODIFIED: Iterate async generator ---
+            try:
+                channel_message_count = 0
+                async for message_data in tg_client.scrape_history(channel, start_date_for_channel):
+                     if message_data:
+                          all_scraped_messages_data.append(message_data)
+                          channel_message_count += 1
+                console.print(f"[dim]   Fetched {channel_message_count} messages from {channel}[/]")
+            except Exception as e:
+                 console.print(f"[red]Error during scraping history for {channel}: {e}[/]")
+                 logging.exception(f"Scrape history error for {channel}")
             
-        # Process the accumulated messages from all channels at the end
-        if all_messages:
+            total_scraped_count += channel_message_count
+            
+        if all_scraped_messages_data:
              console.print(f"\n[bold]Finished scraping all channels. Total messages fetched: {total_scraped_count}[/]")
-             added = gs_client.batch_append(all_messages)
-             console.print(f"[green]Batch append complete. Total unique new messages added: {added}[/]")
         else:
              console.print(f"\n[yellow]No new messages found across any channels.[/]")
              
@@ -237,15 +226,86 @@ async def handle_scrape_mode(tg_client: TelegramScraper, gs_client: GSheetClient
         console.print("[red]Invalid choice![/]")
         return
 
-    # Batch append logic moved inside the choice == '2' block
-    # if not process_one_by_one and all_messages: # This check is redundant now
-    #    pass 
+    # --- NEW: Process scraped message *data* ---
+    total_processed = 0
+    total_failed = 0
+    total_projects_saved = 0
+    if not all_scraped_messages_data:
+        console.print(f"\n[yellow]No new message data found during scraping.[/]")
+    else:
+        console.print(f"\n[bold]Finished scraping. Total message data items fetched: {len(all_scraped_messages_data)}. Analyzing and saving to Supabase...[/]")
+        # Sort by timestamp if available in the dict
+        all_scraped_messages_data.sort(key=lambda data: data.get('timestamp', datetime.min.replace(tzinfo=timezone.utc)))
+
+        # --- Add configuration for delay ---
+        DELAY_BETWEEN_API_CALLS_SEC = 2 # Start with 2 seconds, adjust as needed
+
+        with Progress() as progress:
+            task = progress.add_task("[green]Analyzing message data...", total=len(all_scraped_messages_data))
+            for msg_data in all_scraped_messages_data:
+                 progress.advance(task) # Advance progress first
+                 # Extract data needed by analyzer (handle potential missing keys)
+                 message_text = msg_data.get("text", "")
+                 channel_name = msg_data.get("channel", "Unknown")
+                 timestamp = msg_data.get("timestamp") # Should be datetime obj or None
+                 message_link = msg_data.get("link", "")
+
+                 if not message_link: # Need a link for logging/identification
+                      logging.warning(f"Skipping analysis for data with missing link: {msg_data}")
+                      total_failed += 1
+                      continue
+
+                 progress.update(task, description=f"[green]Analyzing {message_link}...")
+
+                 # Check if the message indicates an error during scraping itself
+                 if msg_data.get("has_error"):
+                      console.print(f"[yellow]Skipping analysis for scraping error: {message_link} - {message_text}[/]")
+                      total_failed += 1
+                      continue
+
+                 # --- Add delay BEFORE the API call ---
+                 await asyncio.sleep(DELAY_BETWEEN_API_CALLS_SEC)
+
+                 try:
+                    # Call analyzer
+                    parsed_data, error = await asyncio.to_thread(
+                        extract_message_data,
+                        message_text,
+                        channel_name,
+                        timestamp, # Pass datetime object or None
+                        message_link
+                    )
+
+                    if error:
+                        console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
+                        total_failed +=1
+                    elif parsed_data:
+                        num_projects = len(parsed_data.get("identified_projects", []))
+                        if num_projects > 0 :
+                             total_projects_saved += num_projects
+                             total_processed += 1
+                             console.print(f"[dim]   Analyzed {message_link}: {num_projects} projects saved.[/]")
+                        else:
+                             total_processed += 1
+                             console.print(f"[dim]   Analyzed {message_link}: No projects identified.[/]")
+                    else:
+                         console.print(f"[yellow]Analysis returned no data and no error for msg {message_link}[/]")
+                         total_failed +=1
+
+                 except Exception as e:
+                     console.print(f"[red]Error during analysis of {message_link}: {e}[/]")
+                     logging.exception(f"Error processing historical message data {message_link}")
+                     total_failed += 1
 
 
-# Renamed function slightly for clarity
+        console.print(f"\n[bold green]Historical processing complete.[/]")
+        console.print(f"Successfully Analyzed/Attempted Save: {total_processed}")
+        console.print(f"Total Projects Saved (across messages): {total_projects_saved}")
+        console.print(f"Failed/Skipped (Scraping or Analysis): {total_failed}")
+
+
 def get_default_start_date_from_user():
     """Get validated default start date from user"""
-    # Simplified: No longer suggests date from sheet, as it's per-channel now
     while True:
         date_str = console.input(
             f"[bold]Enter default start date (YYYY-MM-DD) [if no history found for a channel]: [/]"
@@ -264,205 +324,7 @@ def get_default_start_date_from_user():
             console.print("[red]Invalid date format. Please use YYYY-MM-DD.[/]")
 
 
-async def scrape_single_channel(tg_client, channel, start_date):
-    """Scrape messages and return them without inserting to sheet"""
-    try:
-        console.print(f"\n[bold]Scraping {channel}[/]")
-        entity = await tg_client.client.get_entity(channel)
-
-        with Progress() as progress:
-            task = progress.add_task(f"Scraping from {start_date.date()}", total=None)
-            messages = []
-            error_count = 0
-            max_errors = 5
-
-            async for message in tg_client.scrape_history(entity, start_date):
-                try:
-                    if message:  # Skip None messages
-                        messages.append(message)
-                        progress.update(task, advance=1)
-                        
-                        # Add periodic progress info for large channels
-                        if len(messages) % 100 == 0:
-                            console.print(f"[dim]Progress: {len(messages)} messages scraped[/]")
-                except Exception as msg_error:
-                    error_count += 1
-                    if error_count <= max_errors:
-                        console.print(f"[yellow]Error processing message: {str(msg_error)}[/]")
-                    if error_count > max_errors:
-                        console.print(f"[red]Too many errors ({error_count}), stopping message processing[/]")
-                        break
-
-            console.print(f"[green]Total scraped: {len(messages)} messages from {channel}[/]")
-            return messages
-
-    except Exception as e:
-        console.print(f"[red]Error scraping {channel}: {str(e)}[/]")
-        return []
-
-
-async def handle_listen_mode(tg_client: TelegramScraper, gs_client: GSheetClient):
-    """Handle real-time listening with debug"""
-    console.print(f"[dim]Loaded channels: {load_channels()}[/]")  # Show actual channels
-
-    channels = load_channels()
-    if not channels:
-        console.print("[yellow]No channels found in watchlist! Add channels first.[/]")
-        return
-
-    was_connected = False # Track if client actually connected in this scope
-    try:
-        # Get valid channel entities
-        valid_channels = []
-        for channel in channels:
-            try:
-                entity = await tg_client.client.get_entity(channel)
-                console.print(
-                    f"[dim]Channel info: {entity.id} | {getattr(entity, 'title', '')} | Private: {entity.megagroup}[/]"
-                )
-                valid_channels.append(entity)
-                console.print(
-                    f"[green]✓[/] Listening to: {getattr(entity, 'title', channel)}"
-                )
-            except Exception as e:
-                console.print(f"[red]×[/] Failed to access {channel}: {str(e)}")
-
-        if not valid_channels:
-            console.print("[red]No valid channels to listen to[/]")
-            return
-
-        # Ensure client is connected before attaching handler and running
-        if not tg_client.client.is_connected():
-             console.print("[dim]Connecting client for listener mode...[/]")
-             await tg_client.client.connect()
-        
-        if not tg_client.client.is_connected():
-            console.print("[red]Failed to connect Telegram client for listener.[/]")
-            # Try sending notification even on connection failure - NOW SYNCHRONOUS
-            send_telegram_notification("Failed to connect Telegram client for listener.")
-            return # Exit if connection failed
-            
-        # If we reach here, connection succeeded or was already active
-        was_connected = True
-        console.print("\n[yellow]Listener active. Press Ctrl+C to stop listening[/]")
-
-        @tg_client.client.on(events.NewMessage(chats=valid_channels))
-        async def handler(event):
-            if os.getenv("DEBUG_LOGS", "false").lower() == "true":
-                console.print(f"[dim]RAW: {event.message.id}[/]")
-    
-            try:
-                processed = tg_client._process_message(event.message)
-                if processed:
-                    gs_client.append_message(processed)
-                    console.print(
-                        f"\n[bold cyan]New message @ {processed['timestamp'].astimezone(timezone(timedelta(hours=5))).strftime('%H:%M:%S')}[/]"
-                    )
-                    console.print(
-                        f"[bold]{processed['channel']}:[/] {processed['text'][:100]}..."
-                    )
-                    if 'tags' in processed and processed['tags']:
-                        console.print(f"[dim blue]Tags: {processed['tags']}[/]") 
-                    console.print(f"[dim blue]{processed['link']}[/]")
-    
-            except Exception as e:
-                console.print(f"[red]Error processing message:[/] {str(e)}")
-
-        # Run until disconnected; this blocks until stop or error
-        await tg_client.client.run_until_disconnected()
-        
-        # If run_until_disconnected finishes without an exception
-        console.print("[yellow]Listener stopped unexpectedly (run_until_disconnected finished).[/]")
-        # SYNCHRONOUS CALL
-        send_telegram_notification("Listener stopped unexpectedly (run_until_disconnected finished).")
-
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopped listening due to user interruption (Ctrl+C) - Caught inside listener function.[/]")
-        # Although we try to notify here, the top-level handler is more likely to execute fully.
-        # SYNCHRONOUS CALL
-        send_telegram_notification("Listener stopping normally by user (Ctrl+C).") 
-
-    except Exception as e:
-        error_msg = f"Listener stopped due to error: {str(e)}"
-        console.print(f"[red]Listener error:[/] {str(e)}")
-        # Send notification immediately upon catching other errors - NOW SYNCHRONOUS
-        send_telegram_notification(error_msg)
-    finally:
-        # Cleanup: Attempt to disconnect only if the client was successfully connected in this function
-        if was_connected and tg_client and tg_client.client and tg_client.client.is_connected():
-            console.print("[dim]Attempting to disconnect Telegram client...[/]")
-            try:
-                await tg_client.client.disconnect()
-                console.print("[dim]Disconnected Telegram client after listener stop.[/]")
-            except Exception as disconn_err:
-                console.print(f"[yellow]Error during disconnect after listener stop: {disconn_err}[/]")
-        else:
-            console.print("[dim]Client was not connected in listener scope, skipping disconnect attempt.[/]")
-
-
-def test_gsheets_connection(gs_client: GSheetClient):
-    """Test Google Sheets connection and API quota status"""
-    console.print("\n[bold]Testing Google Sheets Connection[/]")
-    
-    if gs_client.test_connection():
-        console.print("[green]✓ Connection test passed![/]")
-        
-        # Display quota information
-        console.print("\n[bold]Google Sheets API Quota Information:[/]")
-        console.print("[dim]To check your quota usage:[/]")
-        console.print("1. Go to https://console.cloud.google.com/apis/dashboard")
-        console.print("2. Select your project")
-        console.print("3. Check 'Google Sheets API' usage and quota information")
-        
-        # Advanced test - try inserting and deleting a test row
-        try:
-            console.print("\n[bold]Testing write operations...[/]")
-            test_row = ["TEST", "TEST", "This is a test message", "https://t.me/test"]
-            
-            # Use retry logic from GSheetClient to handle potential errors
-            # Fix: Make sure we're using the correct format for batch operations
-            try:
-                gs_client._execute_with_retry(
-                    lambda: gs_client.sheet.append_row(test_row, table_range="A1:D1")
-                )
-                console.print("[green]✓ Test row appended successfully[/]")
-                
-                # Now try to find and delete the test row
-                values = gs_client.sheet.get_all_values()
-                for i, row in enumerate(values):
-                    if row[2] == "This is a test message":
-                        # Found the test row, delete it
-                        gs_client._execute_with_retry(
-                            lambda: gs_client.sheet.delete_rows(i+1, i+2)  # +1 because sheet is 1-indexed
-                        )
-                        console.print("[green]✓ Test row removed successfully[/]")
-                        break
-            except Exception as row_error:
-                console.print(f"[yellow]Row operations failed: {str(row_error)}[/]")
-                console.print("[yellow]Trying alternative method...[/]")
-                
-                # Alternative approach: Insert at specific position then delete
-                gs_client._execute_with_retry(
-                    lambda: gs_client.sheet.insert_row(test_row, index=2)
-                )
-                console.print("[green]✓ Test row inserted successfully[/]")
-                
-                # Delete the row we just added
-                gs_client._execute_with_retry(
-                    lambda: gs_client.sheet.delete_row(2)
-                )
-                console.print("[green]✓ Test row removed successfully[/]")
-            
-            console.print("\n[green bold]All Google Sheets tests passed successfully![/]")
-        except Exception as e:
-            console.print(f"[red]Advanced test failed: {str(e)}[/]")
-            console.print("[yellow]Note: Basic connection is working, but some advanced operations may fail[/]")
-    else:
-        console.print("[red]Failed to connect to Google Sheets[/]")
-        console.print("[yellow]Check your credentials file and internet connection[/]")
-
-
-async def inspect_channel_content(tg_client):
+async def inspect_channel_content(tg_client: TelegramScraper):
     """Analyze channel content for potential issues without inserting to sheets"""
     channel = console.input("[bold]Enter channel to inspect: [/]").strip()
     limit = int(console.input("[bold]Number of messages to inspect (default 50): [/]") or "50")
@@ -524,83 +386,171 @@ async def inspect_channel_content(tg_client):
         console.print(f"[red]Error inspecting {channel}: {str(e)}[/]")
 
 
-async def main():
-    load_dotenv()
+# --- NEW FUNCTION ---
+async def handle_listen_mode(tg_client: TelegramScraper):
+    """Starts the real-time listener for new messages in specified channels."""
+    channels = load_channels()
+    if not channels:
+        console.print("[yellow]No channels found in channels.txt. Add channels first.[/]")
+        return
 
-    session_name = os.getenv("SESSION_NAME")
-    session_file = f"{session_name}.session"
+    # Convert channel names/URLs to Telethon entities if needed, or use usernames directly
+    # For simplicity, assuming `channels` list contains usernames/IDs Telethon understands
+    console.print(f"[info]Attempting to listen to {len(channels)} channels: {', '.join(channels)}[/]")
 
-    # Initialize clients
-    tg_client = TelegramScraper(
-        session_name=session_name,
-        api_id=int(os.getenv("API_ID")),
-        api_hash=os.getenv("API_HASH"),
-    )
+    # Define the event handler function
+    @tg_client.client.on(events.NewMessage(chats=channels))
+    async def message_handler(event: events.NewMessage.Event):
+        message: Message = event.message
+        # Try to get username, fall back to ID or 'Unknown'
+        channel_identifier = "Unknown"
+        if event.chat:
+             channel_identifier = event.chat.username if hasattr(event.chat, 'username') and event.chat.username else str(event.chat.id)
 
-    gs_client = GSheetClient(
-        creds_path=os.getenv("GSHEET_CREDENTIALS"), sheet_url=os.getenv("SHEET_URL")
-    )
+        console.print(f"\n[cyan]---> New message received from '{channel_identifier}' at {message.date.isoformat()}[/]")
 
-    try:
-        await tg_client.client.start()
-        console.print("[green]Connected to Telegram API[/]")
+        # Process the message using the existing helper method in TelegramScraper
+        # This should return a dict similar to what scrape_history yields
+        msg_data = tg_client._process_message(message)
 
-        await interactive_mode(tg_client, gs_client)
-        
-    except Exception as e:
-        if "authorization key" in str(e) and "different IP addresses" in str(e):
-            console.print(
-                "\n[red]Session Error:[/] The Telegram session is invalid due to multiple IP usage."
+        if not msg_data:
+            console.print("[yellow]   Skipping message (processing failed or filtered).[/]")
+            return
+
+        # Extract data needed for analyzer
+        message_text = msg_data.get("text", "")
+        channel_name = msg_data.get("channel", channel_identifier) # Use processed channel name or identifier
+        timestamp = msg_data.get("timestamp") # Should be datetime obj or None
+        message_link = msg_data.get("link", "")
+
+        if not message_link:
+            logging.warning(f"Skipping analysis for message from {channel_name} with missing link: {msg_data}")
+            console.print("[yellow]   Skipping analysis (message link missing).[/]")
+            return
+
+        if msg_data.get("has_error") or message_text == "[Media message]":
+            console.print(f"[yellow]   Skipping analysis for media/error message: {message_link}[/]")
+            return
+
+        console.print(f"[dim]   Analyzing message: {message_link}[/]")
+
+        # --- Add delay BEFORE the API call ---
+        DELAY_BETWEEN_API_CALLS_SEC = 2 # Consistent with scrape mode
+        await asyncio.sleep(DELAY_BETWEEN_API_CALLS_SEC)
+
+        try:
+            # Call analyzer in a separate thread to avoid blocking the event loop
+            # Ensure analyzer functions are imported correctly at the top
+            # Need to ensure init_analyzer was called successfully before this point
+            parsed_data, error = await asyncio.to_thread(
+                extract_message_data,
+                message_text,
+                channel_name,
+                timestamp, # Pass datetime object or None
+                message_link
             )
 
-            # First disconnect the client
-            try:
-                if tg_client.client.is_connected(): await tg_client.client.disconnect()
-            except: pass # Ignore disconnection errors
+            if error:
+                console.print(f"[yellow]   Analysis skipped/failed for msg {message_link}: {error}[/]")
+            elif parsed_data:
+                num_projects = len(parsed_data.get("identified_projects", []))
+                if num_projects > 0 :
+                     console.print(f"[green]   Analyzed {message_link}: {num_projects} projects saved.[/]")
+                else:
+                     console.print(f"[dim]   Analyzed {message_link}: No projects identified.[/]")
+            else:
+                 console.print(f"[yellow]   Analysis returned no data and no error for msg {message_link}[/]")
 
-            # Then try to delete the session file
-            if os.path.exists(session_file):
-                try:
-                    os.remove(session_file)
-                    console.print(
-                        f"[yellow]Deleted invalid session file: {session_file}[/]"
-                    )
-                except Exception as del_err:
-                    console.print(
-                        f"[red]Failed to delete session file: {str(del_err)}[/]"
-                    )
-                    console.print(
-                        "[yellow]Please manually delete the session file before restarting.[/]"
-                    )
+        except Exception as e:
+             console.print(f"[red]   Error during analysis of {message_link}: {e}[/]")
+             logging.exception(f"Error processing real-time message {message_link}")
 
-            console.print("\n[bold]To fix this:[/]")
-            console.print("1. The session file has been deleted")
-            console.print("2. Please restart the application")
-            console.print("3. You'll need to re-authenticate with Telegram")
-            # Don't try to send notification here, client is likely dead
-            return # Exit cleanly 
-        else:
-            error_message = f"Scraper stopped with critical error: {str(e)}"
-            console.print(f"[red]Critical error:[/] {str(e)}")
-            # Attempt to send notification for other critical errors - NOW SYNCHRONOUS
-            send_telegram_notification(error_message)
+    # Start listening
+    console.print("[bold green]Listener started! Waiting for new messages... (Press Ctrl+C to stop)[/]")
+    send_telegram_notification("Listener mode started.") # Notify on listener start
+    # Keep the script running to listen for events
+    try:
+        await tg_client.client.run_until_disconnected()
     finally:
-        try:
-            if tg_client and tg_client.client and tg_client.client.is_connected():
-                await tg_client.client.disconnect()
-        except: pass # Ignore any disconnection errors
+        console.print("[bold yellow]Listener stopped.[/]")
+        send_telegram_notification("Listener mode stopped.") # Notify on listener stop
+
+
+# --- Main Execution ---
+async def main():
+    # Use the correct path relative to main.py for dotenv
+    dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+    load_dotenv(dotenv_path=dotenv_path)
+    console.print("[bold]Starting Telegram Scraper...[/]", justify="center")
+
+    # --- Initialize Analyzer ---
+    if not init_analyzer():
+         console.print("[bold red]Failed to initialize Analyzer (Gemini/Supabase). Check logs and .env file. Exiting.[/]")
+         return
+
+    # --- Load Telegram Credentials ---
+    api_id_str = os.getenv(TELEGRAM_API_ID_KEY)
+    api_hash = os.getenv(TELEGRAM_API_HASH_KEY)
+    session_name = os.getenv(TELEGRAM_SESSION_NAME_KEY, "telegram_scraper") # Default session name if not set
+
+    if not api_id_str or not api_hash:
+        console.print(f"[bold red]Missing {TELEGRAM_API_ID_KEY} or {TELEGRAM_API_HASH_KEY} in .env file. Exiting.[/]")
+        return
+
+    try:
+        api_id = int(api_id_str) # API ID should be an integer
+    except ValueError:
+         console.print(f"[bold red]{TELEGRAM_API_ID_KEY} in .env file is not a valid integer. Exiting.[/]")
+         return
+
+    # --- Initialize Telegram Client ---
+    tg_client = TelegramScraper(session_name=session_name, api_id=api_id, api_hash=api_hash)
+
+    # --- NEW: Explicitly start/connect the client ---
+    console.print("[dim]Connecting to Telegram...[/]")
+    try:
+        # Use client.start() which handles authorization if needed
+        # If phone code is needed, it will prompt here in the console
+        await tg_client.client.start()
+        # Check if authorized
+        if not await tg_client.client.is_user_authorized():
+             console.print("[bold red]Telegram authorization required. Please follow the prompts.[/]")
+             # The start() method should handle the auth flow. If it fails, exit?
+             # Or rely on is_connected check below.
+        # Double check connection
+        if not tg_client.client.is_connected():
+             console.print("[bold red]Failed to establish connection to Telegram after start().[/]")
+             return
+
+        console.print("[green]Telegram client connected successfully.[/]")
+        
+    except Exception as e:
+        console.print(f"[bold red]Failed to connect/authorize Telegram: {e}[/]")
+        logging.exception("Telegram connection/authorization failed.")
+        return
+
+    console.print("[bold green]Initialization Complete![/]")
+    send_telegram_notification("Scraper initialized successfully.") # Notify on successful start
+
+    await interactive_mode(tg_client) # Pass the initialized client
+
+    # Disconnect Telegram client gracefully
+    console.print("[dim]Disconnecting Telegram client...[/]")
+    await tg_client.client.disconnect() # Disconnect the underlying client
+    console.print("[bold]Telegram client disconnected.[/]")
+    send_telegram_notification("Scraper shut down.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # This top-level handler is the most reliable place for Ctrl+C notification
-        console.print("\n[yellow]Operation cancelled by user (Detected at top level)[/]")
-        # Try final notification here using synchronous call
-        send_telegram_notification("Scraper process terminated by user (Ctrl+C).")
+        console.print("\n[yellow]Ctrl+C detected. Shutting down...[/]")
     except Exception as e:
-        # Log critical errors that weren't caught elsewhere
-        console.print(f"[red]Unhandled critical error at top level:[/] {str(e)}")
-        # Try a final notification attempt
-        send_telegram_notification(f"Scraper process terminated with unhandled error: {str(e)}")
+         console.print(f"[bold red]\n--- UNEXPECTED CRITICAL ERROR ---[/]")
+         logging.exception("Critical error in main execution loop.")
+         console.print(f"[red]{e}[/]")
+         try:
+             send_telegram_notification(f"Scraper CRASHED: {str(e)[:500]}")
+         except Exception as notify_err:
+             console.print(f"[red]Failed to send crash notification: {notify_err}[/]")

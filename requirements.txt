@@ -2,4 +2,7 @@ telethon
 gspread
 google-auth-oauthlib
 python-dotenv
-rich 
+rich
+requests
+google-generativeai>=0.4.0
+supabase>=1.0.0 

@@ -1,15 +1,32 @@
     # Environment variables
     .env
 
-    # Telegram session file
-    *.session
-    *.session-journal
+    # Database files
+    *.db
+
+    # Log files
+    logs/
+    *.log
+
+    # Data files
+    *.csv
 
     # Python cache
     __pycache__/
     *.pyc
-    *.pyo
-    *.pyd
+
+    # Telegram session files
+    *.session
+    *.session-journal
+
+    # Google Cloud credentials
+    google_creds.json
+
+    # User-specific channel list
+    channels.txt
+
+    # Other
+    # Add any other files/directories to ignore here
 
     # Virtual environment (if you use one)
     venv/

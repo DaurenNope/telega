@@ -1,6 +1,91 @@
-# Telegram to Google Sheets Scraper
+# Telegram Project Update Analyzer
 
-This Python script scrapes messages from specified Telegram channels or chats and saves them into a Google Sheet. It's designed to be run either interactively for specific tasks or continuously in a listening mode to archive messages as they arrive.
+This project listens to specified Telegram channels, analyzes messages using the Gemini API to identify crypto project updates, and saves the structured data to Supabase.
+
+## Setup
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repo-url>
+    cd telega
+    ```
+
+2.  **Create a Python virtual environment (optional but recommended):**
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+    ```
+
+3.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Configure Environment Variables:**
+    *   Copy `.env.example` to `.env`:
+        ```bash
+        cp .env.example .env
+        ```
+    *   Edit the `.env` file and fill in your actual credentials:
+        *   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`: Get from [my.telegram.org](https://my.telegram.org/apps).
+        *   `TELEGRAM_SESSION_NAME`: A name for your session file (e.g., `telegram_scraper`).
+        *   `GEMINI_API_KEY`: Your Google AI API key.
+        *   `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`: Your Supabase project URL and service role key.
+        *   `NOTIFICATION_BOT_TOKEN` and `NOTIFICATION_CHAT_ID`: (Optional) For sending crash/status notifications via a Telegram bot.
+
+5.  **Configure Channels:**
+    *   Copy `channels.example.txt` to `channels.txt`:
+        ```bash
+        cp channels.example.txt channels.txt
+        ```
+    *   Edit `channels.txt` and add the target Telegram channel usernames or invite links, one per line.
+
+6.  **(Optional) Google Sheets Tester:**
+    *   If using `tests/test_analyzer_gsheet.py`, place your Google Cloud service account key file named `google_creds.json` in the `telega/tests/` directory.
+    *   Ensure the service account has access to the Google Sheet specified in the script.
+    *   **Important:** Add `tests/google_creds.json` to your `.gitignore` file if you haven't already via the pattern.
+
+## Running the Application
+
+```bash
+python src/main.py
+```
+
+Follow the interactive menu prompts:
+*   **Connect:** The first time you run, you may need to authenticate your Telegram account by entering your phone number and a code sent via Telegram.
+*   **Scrape History (Option 1):** Fetches historical messages from specified channels and analyzes them.
+*   **Start Listener (Option 2):** Runs continuously, listening for new messages in the specified channels and analyzing them in real-time.
+*   **Clean Channel List (Option 4):** Removes duplicates from `channels.txt`.
+*   **Exit (Option 6):** Stops the application.
+
+## Running Tests (Optional)
+
+To run the Google Sheet based test:
+
+```bash
+cd tests
+python test_analyzer_gsheet.py [number_of_rows_to_test]
+cd ..
+```
+Replace `[number_of_rows_to_test]` with the number of rows you want to process from the sheet (optional, defaults to all).
+
+### Running the Supabase Analyzer Test (Optional)
+
+This test fetches the most recent messages directly from your Supabase database and runs the analyzer on them.
+
+```bash
+cd tests
+# Test latest 10 rows (default)
+python test_analyzer_supabase.py
+
+# Test latest 50 rows
+python test_analyzer_supabase.py 50
+
+# Test latest N rows
+python test_analyzer_supabase.py N
+
+cd ..
+```
 
 ## Features
 
