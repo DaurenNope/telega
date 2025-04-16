@@ -13,7 +13,7 @@ import requests
 import time # Import time module
 
 # --- NEW: Import analyzer functions ---
-from .analyzer import init_analyzer, extract_message_data # Relative import
+from analyzer import init_analyzer, extract_message_data # Relative import
 
 # Configure logging
 logging.basicConfig(
@@ -229,7 +229,8 @@ async def handle_scrape_mode(tg_client: TelegramScraper):
     # --- NEW: Process scraped message *data* ---
     total_processed = 0
     total_failed = 0
-    total_projects_saved = 0
+    total_projects_identified_overall = 0 # Track identified projects
+
     if not all_scraped_messages_data:
         console.print(f"\n[yellow]No new message data found during scraping.[/]")
     else:
@@ -238,70 +239,72 @@ async def handle_scrape_mode(tg_client: TelegramScraper):
         all_scraped_messages_data.sort(key=lambda data: data.get('timestamp', datetime.min.replace(tzinfo=timezone.utc)))
 
         # --- Add configuration for delay ---
-        DELAY_BETWEEN_API_CALLS_SEC = 2 # Start with 2 seconds, adjust as needed
+        # Delay in seconds between processing each message (adjust as needed)
+        DELAY_BETWEEN_MESSAGES_SEC = 2
 
         with Progress() as progress:
             task = progress.add_task("[green]Analyzing message data...", total=len(all_scraped_messages_data))
-            for msg_data in all_scraped_messages_data:
+            for i, msg_data in enumerate(all_scraped_messages_data):
                  progress.advance(task) # Advance progress first
                  # Extract data needed by analyzer (handle potential missing keys)
                  message_text = msg_data.get("text", "")
                  channel_name = msg_data.get("channel", "Unknown")
                  timestamp = msg_data.get("timestamp") # Should be datetime obj or None
-                 message_link = msg_data.get("link", "")
+                 message_link = msg_data.get("link", "Unknown Link") # Get link if available
 
-                 if not message_link: # Need a link for logging/identification
-                      logging.warning(f"Skipping analysis for data with missing link: {msg_data}")
-                      total_failed += 1
-                      continue
+                 # Validate required data
+                 if not message_text or not timestamp:
+                     console.print(f"[yellow]Skipping message data item (missing text or timestamp): {msg_data.get('link')}[/]")
+                     total_failed += 1 # Count as failed if crucial data is missing
+                     continue
 
-                 progress.update(task, description=f"[green]Analyzing {message_link}...")
+                 console.print(f"\n[bold]Processing message {i+1}/{len(all_scraped_messages_data)}[/] Link: {message_link}")
 
-                 # Check if the message indicates an error during scraping itself
-                 if msg_data.get("has_error"):
-                      console.print(f"[yellow]Skipping analysis for scraping error: {message_link} - {message_text}[/]")
-                      total_failed += 1
-                      continue
-
-                 # --- Add delay BEFORE the API call ---
-                 await asyncio.sleep(DELAY_BETWEEN_API_CALLS_SEC)
-
+                 # --- Call the Analyzer (Reverted Logic) ---
                  try:
-                    # Call analyzer
-                    parsed_data, error = await asyncio.to_thread(
-                        extract_message_data,
-                        message_text,
-                        channel_name,
-                        timestamp, # Pass datetime object or None
-                        message_link
-                    )
+                     # Reverted: returns (aggregated_payload, error_message)
+                     aggregated_payload, error = extract_message_data(
+                         message_text=message_text,
+                         channel=channel_name,
+                         timestamp=timestamp,
+                         message_link=message_link
+                     )
 
-                    if error:
-                        console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
-                        total_failed +=1
-                    elif parsed_data:
-                        num_projects = len(parsed_data.get("identified_projects", []))
-                        if num_projects > 0 :
-                             total_projects_saved += num_projects
-                             total_processed += 1
-                             console.print(f"[dim]   Analyzed {message_link}: {num_projects} projects saved.[/]")
-                        else:
-                             total_processed += 1
-                             console.print(f"[dim]   Analyzed {message_link}: No projects identified.[/]")
-                    else:
-                         console.print(f"[yellow]Analysis returned no data and no error for msg {message_link}[/]")
+                     # --- Handle Analyzer Results --- 
+                     if error:
+                         console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
                          total_failed +=1
+                     elif aggregated_payload:
+                         # Check if projects were actually identified in the successful analysis
+                         # Use 'identified_project_names' which should be a comma-sep string or None
+                         if aggregated_payload.get("identified_project_names"):
+                             # Count identified projects by splitting the string
+                             num_projects = len(aggregated_payload["identified_project_names"].split(','))
+                             total_projects_identified_overall += num_projects
+                             total_processed += 1
+                             console.print(f"[dim]   Analyzed & Saved {message_link}: {num_projects} projects identified.[/]")
+                         else:
+                             # Analysis succeeded, but Gemini identified no projects
+                             total_processed += 1 # Still counts as processed
+                             console.print(f"[dim]   Analyzed & Saved {message_link}: No projects identified.[/]")
+                     else:
+                          # This case means analysis was successful but returned None (no projects found)
+                          total_processed += 1 # Still count as processed
+                          console.print(f"[dim]   Analyzed {message_link}: No projects identified, nothing saved.[/]")
 
-                 except Exception as e:
-                     console.print(f"[red]Error during analysis of {message_link}: {e}[/]")
-                     logging.exception(f"Error processing historical message data {message_link}")
+                 except Exception as analysis_err:
+                     console.print(f"[bold red]CRITICAL ERROR[/] during message analysis: {analysis_err}. Link: {message_link}")
+                     logging.exception(f"Message analysis critical error. Link: {message_link}")
                      total_failed += 1
 
+                 # --- Apply Delay ---
+                 console.print(f"[dim]Waiting {DELAY_BETWEEN_MESSAGES_SEC} seconds...")
+                 time.sleep(DELAY_BETWEEN_MESSAGES_SEC)
 
-        console.print(f"\n[bold green]Historical processing complete.[/]")
-        console.print(f"Successfully Analyzed/Attempted Save: {total_processed}")
-        console.print(f"Total Projects Saved (across messages): {total_projects_saved}")
-        console.print(f"Failed/Skipped (Scraping or Analysis): {total_failed}")
+        console.print(f"\n[bold green]Finished processing message data.[/]")
+        console.print(f"Successfully Processed (Messages Analyzed): {total_processed}")
+        console.print(f"Total Projects Identified (Across All Processed Messages): {total_projects_identified_overall}")
+        console.print(f"Failed/Skipped (Scraping or Analysis Error): {total_failed}")
 
 
 def get_default_start_date_from_user():
@@ -401,69 +404,66 @@ async def handle_listen_mode(tg_client: TelegramScraper):
     # Define the event handler function
     @tg_client.client.on(events.NewMessage(chats=channels))
     async def message_handler(event: events.NewMessage.Event):
-        message: Message = event.message
-        # Try to get username, fall back to ID or 'Unknown'
-        channel_identifier = "Unknown"
-        if event.chat:
-             channel_identifier = event.chat.username if hasattr(event.chat, 'username') and event.chat.username else str(event.chat.id)
-
-        console.print(f"\n[cyan]---> New message received from '{channel_identifier}' at {message.date.isoformat()}[/]")
-
-        # Process the message using the existing helper method in TelegramScraper
-        # This should return a dict similar to what scrape_history yields
-        msg_data = tg_client._process_message(message)
-
-        if not msg_data:
-            console.print("[yellow]   Skipping message (processing failed or filtered).[/]")
-            return
-
-        # Extract data needed for analyzer
-        message_text = msg_data.get("text", "")
-        channel_name = msg_data.get("channel", channel_identifier) # Use processed channel name or identifier
-        timestamp = msg_data.get("timestamp") # Should be datetime obj or None
-        message_link = msg_data.get("link", "")
-
-        if not message_link:
-            logging.warning(f"Skipping analysis for message from {channel_name} with missing link: {msg_data}")
-            console.print("[yellow]   Skipping analysis (message link missing).[/]")
-            return
-
-        if msg_data.get("has_error") or message_text == "[Media message]":
-            console.print(f"[yellow]   Skipping analysis for media/error message: {message_link}[/]")
-            return
-
-        console.print(f"[dim]   Analyzing message: {message_link}[/]")
-
-        # --- Add delay BEFORE the API call ---
-        DELAY_BETWEEN_API_CALLS_SEC = 2 # Consistent with scrape mode
-        await asyncio.sleep(DELAY_BETWEEN_API_CALLS_SEC)
-
+        # Initialize link variable to prevent UnboundLocalError in except block
+        message_link = "Unknown Link"
+        # --- ADD DELAY FOR REAL-TIME LISTENER TOO (OPTIONAL BUT RECOMMENDED) ---
+        # Delay in seconds between processing each incoming message in real-time
+        REALTIME_DELAY_SEC = 2
+        # --- Process Message (Existing Logic) ---
         try:
-            # Call analyzer in a separate thread to avoid blocking the event loop
-            # Ensure analyzer functions are imported correctly at the top
-            # Need to ensure init_analyzer was called successfully before this point
-            parsed_data, error = await asyncio.to_thread(
-                extract_message_data,
-                message_text,
-                channel_name,
-                timestamp, # Pass datetime object or None
-                message_link
+            message_object: Message = event.message
+
+            # Get entity info using the underlying client
+            entity = await tg_client.client.get_entity(message_object.peer_id)
+            # Prefer username, fallback to title, then ID
+            channel_name = getattr(entity, 'username', None)
+            if not channel_name:
+                channel_name = getattr(entity, 'title', None)
+            if not channel_name:
+                channel_name = str(getattr(entity, 'id', 'UnknownID'))
+
+            message_text = message_object.text or "[Media message]"
+            # Construct the link directly using entity.id (chat_id) and message_object.id
+            message_link = f"https://t.me/c/{entity.id}/{message_object.id}"
+            timestamp = message_object.date # Already timezone-aware
+
+            console.print(f"\n[bold blue]---> Real-time message received:[/]")
+            console.print(f"Channel: @{channel_name}")
+            console.print(f"Link: {message_link}")
+            console.print(f"Timestamp: {timestamp}")
+            console.print(f"Content: {message_text[:100]}...")
+
+            # --- Call Analyzer (Reverted Logic) ---
+            console.print("[dim]Analyzing message...[/]")
+            # Reverted: returns (aggregated_payload, error_message)
+            aggregated_payload, error = extract_message_data(
+                message_text=message_text,
+                channel=channel_name,
+                timestamp=timestamp,
+                message_link=message_link
             )
 
+            # --- Handle Analyzer Results --- 
             if error:
-                console.print(f"[yellow]   Analysis skipped/failed for msg {message_link}: {error}[/]")
-            elif parsed_data:
-                num_projects = len(parsed_data.get("identified_projects", []))
-                if num_projects > 0 :
-                     console.print(f"[green]   Analyzed {message_link}: {num_projects} projects saved.[/]")
+                console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
+            elif aggregated_payload:
+                if aggregated_payload.get("identified_project_names"):
+                    num_projects = len(aggregated_payload["identified_project_names"].split(','))
+                    console.print(f"[green]   Analyzed & Saved {message_link}: {num_projects} projects identified.[/]")
                 else:
-                     console.print(f"[dim]   Analyzed {message_link}: No projects identified.[/]")
+                    console.print(f"[dim]   Analyzed & Saved {message_link}: No projects identified.[/]")
             else:
-                 console.print(f"[yellow]   Analysis returned no data and no error for msg {message_link}[/]")
+                console.print(f"[dim]   Analyzed {message_link}: No projects identified, nothing saved.[/]")
 
         except Exception as e:
-             console.print(f"[red]   Error during analysis of {message_link}: {e}[/]")
-             logging.exception(f"Error processing real-time message {message_link}")
+            console.print(f"[bold red]ERROR[/] processing real-time message: {e}")
+            # message_link should now be defined, even if it's "Unknown Link"
+            logging.exception(f"Error in real-time message handler for link {message_link}")
+
+        # --- Apply Delay ---
+        finally:
+            console.print(f"[dim]Waiting {REALTIME_DELAY_SEC} seconds before processing next event...")
+            await asyncio.sleep(REALTIME_DELAY_SEC) # Use asyncio.sleep in async context
 
     # Start listening
     console.print("[bold green]Listener started! Waiting for new messages... (Press Ctrl+C to stop)[/]")
