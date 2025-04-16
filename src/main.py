@@ -11,6 +11,7 @@ from telethon import events
 from telethon.tl.types import Message
 import requests
 import time # Import time module
+from rich.panel import Panel
 
 # --- NEW: Import analyzer functions ---
 from analyzer import init_analyzer, extract_message_data # Relative import
@@ -140,13 +141,21 @@ def clean_channels_file():
 async def interactive_mode(tg_client: TelegramScraper):
     """Interactive command-line interface (GSheet options removed)"""
     while True:
-        console.print("\n[bold cyan]Telegram Scraper Menu[/]", justify="center")
-        console.print("1. Scrape channel history")
-        console.print("2. Start real-time listener")
-        console.print("4. Clean channel list")
-        console.print("6. Exit")
-
-        choice = console.input("\n[bold]Enter your choice (1-2, 4, 6): [/]")
+        console.print(
+            Panel(
+                """
+[bold cyan]1.[/] Scrape channel history
+[bold cyan]2.[/] Start real-time listener
+[bold cyan]4.[/] Clean channel list
+[bold cyan]6.[/] Exit
+""",
+                title="[bold green]Telegram Scraper Menu[/]",
+                expand=False,
+            )
+        )
+        console.print("\n[bold]Enter your choice (1-2, 4, 6): [/]", end="") # Print prompt with rich
+        choice = input() # Use standard input
+        logging.info(f"User choice: {choice}")
 
         if choice == "1":
             await handle_scrape_mode(tg_client)
@@ -260,10 +269,10 @@ async def handle_scrape_mode(tg_client: TelegramScraper):
 
                  console.print(f"\n[bold]Processing message {i+1}/{len(all_scraped_messages_data)}[/] Link: {message_link}")
 
-                 # --- Call the Analyzer (Reverted Logic) ---
+                 # --- Call the Analyzer --- 
                  try:
-                     # Reverted: returns (aggregated_payload, error_message)
-                     aggregated_payload, error = extract_message_data(
+                     # Ensure this line unpacks THREE values:
+                     updates_saved_count, guide_saved_flag, error_message = extract_message_data(
                          message_text=message_text,
                          channel=channel_name,
                          timestamp=timestamp,
@@ -271,26 +280,27 @@ async def handle_scrape_mode(tg_client: TelegramScraper):
                      )
 
                      # --- Handle Analyzer Results --- 
-                     if error:
-                         console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
+                     if error_message:
+                         # Log error from analyzer (e.g., parsing error, DB save error)
+                         console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error_message}[/]")
                          total_failed +=1
-                     elif aggregated_payload:
-                         # Check if projects were actually identified in the successful analysis
-                         # Use 'identified_project_names' which should be a comma-sep string or None
-                         if aggregated_payload.get("identified_project_names"):
-                             # Count identified projects by splitting the string
-                             num_projects = len(aggregated_payload["identified_project_names"].split(','))
-                             total_projects_identified_overall += num_projects
-                             total_processed += 1
-                             console.print(f"[dim]   Analyzed & Saved {message_link}: {num_projects} projects identified.[/]")
-                         else:
-                             # Analysis succeeded, but Gemini identified no projects
-                             total_processed += 1 # Still counts as processed
-                             console.print(f"[dim]   Analyzed & Saved {message_link}: No projects identified.[/]")
                      else:
-                          # This case means analysis was successful but returned None (no projects found)
-                          total_processed += 1 # Still count as processed
-                          console.print(f"[dim]   Analyzed {message_link}: No projects identified, nothing saved.[/]")
+                         # Analysis succeeded, check what was saved
+                         log_parts = []
+                         if updates_saved_count > 0:
+                              total_processed += updates_saved_count # Count each saved update
+                              log_parts.append(f"{updates_saved_count} updates saved")
+                         if guide_saved_flag:
+                              total_processed += 1 # Count the saved guide entry
+                              log_parts.append("guide entry saved")
+                         
+                         if not log_parts:
+                              # No error, but nothing was saved (e.g., AI found no relevant updates/guide)
+                              console.print(f"[dim]   Analyzed {message_link}: No relevant content identified.")
+                              # Consider if this should count as processed or skipped? Let's count as processed.
+                              total_processed += 1 
+                         else:
+                              console.print(f"[dim]   Processed {message_link}: {', '.join(log_parts)}.")
 
                  except Exception as analysis_err:
                      console.print(f"[bold red]CRITICAL ERROR[/] during message analysis: {analysis_err}. Link: {message_link}")
@@ -433,10 +443,10 @@ async def handle_listen_mode(tg_client: TelegramScraper):
             console.print(f"Timestamp: {timestamp}")
             console.print(f"Content: {message_text[:100]}...")
 
-            # --- Call Analyzer (Reverted Logic) ---
+            # --- Call Analyzer --- 
             console.print("[dim]Analyzing message...[/]")
-            # Reverted: returns (aggregated_payload, error_message)
-            aggregated_payload, error = extract_message_data(
+            # Ensure this call unpacks THREE values:
+            updates_saved_count, guide_saved_flag, error_message = extract_message_data(
                 message_text=message_text,
                 channel=channel_name,
                 timestamp=timestamp,
@@ -444,16 +454,20 @@ async def handle_listen_mode(tg_client: TelegramScraper):
             )
 
             # --- Handle Analyzer Results --- 
-            if error:
-                console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error}[/]")
-            elif aggregated_payload:
-                if aggregated_payload.get("identified_project_names"):
-                    num_projects = len(aggregated_payload["identified_project_names"].split(','))
-                    console.print(f"[green]   Analyzed & Saved {message_link}: {num_projects} projects identified.[/]")
-                else:
-                    console.print(f"[dim]   Analyzed & Saved {message_link}: No projects identified.[/]")
+            if error_message:
+                console.print(f"[yellow]Analysis skipped/failed for msg {message_link}: {error_message}[/]")
             else:
-                console.print(f"[dim]   Analyzed {message_link}: No projects identified, nothing saved.[/]")
+                # Log success based on what was saved
+                log_parts = []
+                if updates_saved_count > 0:
+                     log_parts.append(f"{updates_saved_count} updates saved")
+                if guide_saved_flag:
+                     log_parts.append("guide entry saved")
+                
+                if not log_parts:
+                     console.print(f"[dim]   Analyzed {message_link}: No relevant content identified.")
+                else:
+                     console.print(f"[green]   Processed {message_link}: {', '.join(log_parts)}.[/]")
 
         except Exception as e:
             console.print(f"[bold red]ERROR[/] processing real-time message: {e}")

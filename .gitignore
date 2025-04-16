@@ -37,3 +37,4 @@
     .vscode/
     .idea/
     credentials.json
+    .csv
