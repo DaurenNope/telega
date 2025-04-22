@@ -174,6 +174,23 @@ def extract_message_data(message_text: str, channel: str, timestamp: Any, messag
         logging.error("ANALYZER_ERROR: Analyzer not initialized or Gemini model unavailable.")
         return 0, False, "Analyzer not initialized."
 
+    # --- ADDED: Pre-check for existing message link ---
+    if supabase:
+        try:
+            count_response = supabase.table(SUPABASE_TABLE_NAME)\
+                .select('id', count='exact')\
+                .eq('source_message_link', message_link)\
+                .limit(1)\
+                .execute()
+
+            if count_response.count > 0:
+                logging.info(f"Skipping analysis: Message link already exists in DB. Link: {message_link}")
+                return 0, False, "Skipped: Message link already processed"
+        except Exception as e:
+            logging.warning(f"Could not perform pre-check for message link {message_link}: {e}", exc_info=True)
+            # Decide if you want to proceed anyway or return an error. Proceeding for now.
+    # --- END ADDED ---
+
     # 1. Basic Input Validation
     if not message_text or message_text.strip() == "" or "[Media message]" in message_text:
         logging.warning(f"Skipping message analysis due to empty or media content. Link: {message_link}")
@@ -190,115 +207,145 @@ def extract_message_data(message_text: str, channel: str, timestamp: Any, messag
         logging.error(f"Failed to clean message text for link {message_link}: {e}", exc_info=True)
         cleaned_message_text = message_text[:MAX_MSG_LENGTH]
 
-    # 2. Construct Prompt (Multi-update + Guide detection + Uncertainty flag)
+    # 2. Construct Prompt
+    # Updated prompt AGAIN for stricter uniqueness and noise handling
     prompt_template = f"""
-Analyze the following Telegram message content. Perform two tasks:
+**ULTRA-CRITICAL INSTRUCTION: Ensure every object in the final 'identified_projects' list is UNIQUE for this message. Do NOT repeat the exact same combination of 'project_name' and 'activity_type'. If the same update is mentioned multiple times, represent it only ONCE.**
 
-**Task 1: Identify ALL Distinct Project Updates**
-Extract details for EACH specific crypto project update into a list called "identified_updates".
+Analyze the following Telegram message content. Identify ALL distinct crypto projects mentioned **that are directly associated with a specific update, task, or actionable event relevant to the project itself (e.g., testnet, airdrop, protocol change, partnership, guide for specific project tasks)**. Extract the specified information for EACH relevant project/activity pair into a JSON object containing a list called "identified_projects".
 
-**Task 2: Identify if Message is a Guide**
-Determine if the overall message primarily functions as a step-by-step guide or tutorial. Provide this as top-level boolean `is_guide` and text `guide_summary` fields.
+**CRITICAL INSTRUCTIONS (Continued):**
+1.  **Focus:** Only include projects with concrete updates relevant to their ecosystem (testnets, airdrops, mainnet launches, important governance votes, specific user tasks/quests, major partnerships, exchange listings for THAT project's token, project-specific guides).
+2.  **Exclusions:**
+    *   Exclude general market commentary, price speculation unrelated to a specific project event, predictions, generic advice, channel self-promotion, giveaways not tied to a specific project's activity, and cross-promotions unless it's a significant partnership announcement.
+    *   Exclude simple mentions of a project name without a clear, actionable update or event tied to it.
+    *   Exclude lists of many projects (e.g., "Top 5 projects to watch") unless each has a *distinct, specific* update described in the message.
+    *   Exclude projects mentioned only as examples or comparisons.
+3.  **Project Name:** Use the primary, recognizable name (e.g., "EigenLayer", "LayerZero", "ZkSync"). If multiple names are used, pick the most common or official one. Handle variations (e.g., "ZkSync Era" -> "ZkSync").
+4.  **Activity Type:** Use ONE category from this specific list:
+    *   `Testnet`: For testnet phases, incentivized testnets, instructions related to testnets.
+    *   `Airdrop Claim`: For instructions or announcements about claiming an airdrop.
+    *   `Airdrop Check`: For tools or announcements about checking eligibility for an airdrop.
+    *   `Potential Airdrop`: Hints or activities suggested to qualify for a *future* airdrop (use this sparingly).
+    *   `Token Sale/IDO`: For public/private sales, IDOs, launchpad events.
+    *   `Mainnet Launch`: For the launch of a project's main network.
+    *   `Protocol Update`: Significant changes, new features, upgrades to the core protocol.
+    *   `Governance`: Important proposals, voting periods, results.
+    *   `Partnership`: Significant collaboration announced between projects.
+    *   `Exchange Listing`: Announcement of a project's token listing on a specific exchange.
+    *   `Waitlist/Form`: Requirement to sign up via waitlist or form for access/rewards.
+    *   `Quest/Task`: Specific actions users need to take (Galxe, Zealy, etc.) for rewards/participation *directly related to a project*.
+    *   `NFT Mint`: Related to minting NFTs for a specific project.
+    *   `Community/Social`: Contests, events, AMAs, Discord/Twitter specific activities related to the project.
+    *   `Guide/Tutorial`: If the message provides instructions or a guide *for a specific project's activities* (e.g., "How to farm ZkSync airdrop").
+    *   `Security Alert`: Warnings about scams or vulnerabilities related to the project.
+    *   `General Update`: If the update is significant but doesn't fit neatly above (use sparingly).
+    *   `Funding/Investment`: Announcement of funding rounds.
+    *   `Noise/Advertisement`: For messages that are primarily market commentary, speculation, channel promotion, or other non-actionable content *even if they mention project names*. If a message mentions multiple projects but is mostly noise, you might extract a single "Noise/Advertisement" entry with `project_name: "Market Analysis"` or similar.
+5.  **Summary:** Provide a concise (1-2 sentences) summary of the specific update or activity for *that* project. Focus on the core action or news.
+6.  **Uncertainty (`needs_review`):** Set to `true` if you are uncertain about the project name, activity type, or if the update is truly significant/actionable. Otherwise, set to `false`. Be conservative; flag if unsure.
+7.  **Deadlines:**
+    a. `deadline_original_text`: Extract the *exact text* indicating a deadline (e.g., "until March 15th", "by 20:00 UTC", "next Friday", "in 2 weeks"). If no specific deadline is mentioned, output `null`. Do NOT include vague terms like "soon" or "later".
+    b. `deadline_parsed`: If `deadline_original_text` is not null, parse it into a standard `YYYY-MM-DD HH:MM:SS+ZZ:ZZ` timestamp format. Assume the current year if not specified. Assume a default time of `19:00:00` if only a date is given. **Assume the time is relative to UTC+5 unless another timezone is explicitly mentioned (convert that timezone to UTC+5 equivalent).** If the deadline text is ambiguous or cannot be parsed confidently, output `null`. **If only a time is mentioned without a date (e.g., '12:00 UTC'), try to infer the date from context if possible (e.g., 'today', 'tomorrow'). If no date context exists, output null for `deadline_parsed`.**
+8.  **Output Format:** Return ONLY a valid JSON object with the key "identified_projects" whose value is a list of JSON objects, each representing a unique project update found. If no relevant project updates are found, return `{{"identified_projects": []}}`.
 
-**CRITICAL INSTRUCTIONS for Task 1 (Project Updates):**
-*   **Focus:** Identify specific updates, events, or tasks related to distinct crypto projects/protocols/tokens.
-*   **Project Definition:** Only identify specific blockchain projects, protocols, dApps, or tokens as 'project_name'.
-*   **Noise/Irrelevant:** Ignore general market commentary, pure promotions, simple mentions without context. If no specific updates found, return an empty list `[]` for "identified_updates".
-*   **Granularity:** Use the most specific `activity_type` possible from the list below.
-
-**Message Content:**
----
-{cleaned_message_text}
----
-
-**Source Channel:** {channel}
-
-**Detailed Extraction Instructions for EACH object in "identified_updates" list:**
-1.  `project_name`: The specific project/protocol/token this update is about.
-2.  `activity_type`: Classify the specific activity. Choose ONE, be specific: Testnet, Airdrop Check, Airdrop Claim, Galxe Quest, Zealy Quest, Layer3 Quest, Other Quest/Task, Waitlist/Form, Partnership, Protocol Upgrade, Network Upgrade, New Feature Launch, Token Launch, Token Sale/IDO, Token Unlock, Token Burn, Exchange Listing, Staking Update, Yield Opportunity, DeFi Strategy, Vote/Governance, New Project Announcement, Community Call/AMA, Giveaway/Contest, Funding Round, Node Opportunity, Security Alert, General News/Update.
-3.  `summary`: A brief 1-2 sentence summary of THIS specific update.
-4.  `is_node_opportunity`: true/false if THIS update involves running nodes/validators.
-5.  `key_links`: List relevant non-referral URLs related to THIS update.
-6.  `referral_links`: List ONLY referral/invite URLs related to THIS update.
-7.  `deadline`: Note any specific deadline mentioned for THIS update (text format, otherwise null).
-8.  `required_actions_summary`: Briefly summarize required actions for THIS update (text format, otherwise null).
-9.  `is_uncertain`: Boolean `true` if you are not confident about the classification or details of THIS specific update, `false` otherwise.
-
-**Extraction Instructions for Task 2 (Guide Identification):**
-*   `is_guide`: Top-level boolean field. Set to `true` if the *primary purpose* of the overall message is a step-by-step guide/tutorial, `false` otherwise.
-*   `guide_summary`: Top-level text field. If `is_guide` is `true`, provide a brief summary describing the guide\'s topic (e.g., "Guide on farming ZkSync airdrop"). Omit or set to null if `is_guide` is `false`.
-*   `primary_subject_project`: Top-level text field. If `is_guide` is `true`, identify the **single, main** project/protocol/token the guide is about. Even if other projects are mentioned as *part* of the guide (e.g., bridging via another protocol), choose the one that represents the **core topic or goal**. Use `null` ONLY if the guide is truly generic (e.g., 'How to set up a wallet') or if multiple distinct projects are discussed with clearly **equal importance** and no single main focus can be reasonably determined.
-
-**Output Format:**
-Output ONLY a single JSON object containing the top-level `is_guide`, `guide_summary`, `primary_subject_project` (if applicable), and the `identified_updates` list. Ensure valid JSON.
-
-**Example Output (Message contains updates AND is also a guide):**
+**Example 1 (Multiple Projects, Deadline):**
+*Message:* "Big news! EigenLayer Phase 2 restaking is live until June 30th. Also, ZkSync just launched their mainnet v2.4 upgrade. Don't forget the LayerZero airdrop checker is up!"
+*Output:*
 ```json
 {{
-  "is_guide": true,
-  "guide_summary": "Guide explaining how to participate in ZetaChain quests and check Hyperlane airdrop.",
-  "primary_subject_project": "ZetaChain",
-  "identified_updates": [
+  "identified_projects": [
     {{
-      "project_name": "ZetaChain",
-      "activity_type": "Galxe Quest",
-      "summary": "ZetaChain released new weekly quests on Galxe for XP farming.",
-      "is_node_opportunity": false,
-      "key_links": ["https://galxe.com/zetachain/campaign/GCxyz"],
-      "referral_links": [],
-      "deadline": null,
-      "required_actions_summary": "Complete tasks on Galxe platform.",
-      "is_uncertain": false
+      "project_name": "EigenLayer",
+      "activity_type": "Protocol Update",
+      "summary": "Phase 2 restaking is now live.",
+      "needs_review": false,
+      "deadline_original_text": "until June 30th",
+      "deadline_parsed": "2024-06-30 19:00:00+05:00"
     }},
     {{
-      "project_name": "Hyperlane",
-      "activity_type": "Airdrop Check",
-      "summary": "Hyperlane airdrop claim registration extended.",
-      "is_node_opportunity": false,
-      "key_links": ["https://x.com/hyperlane/status/1911788309119918171"],
-      "referral_links": [],
-      "deadline": "15.04.25 22:00 MSK",
-      "required_actions_summary": "Register for claim if eligible.",
-      "is_uncertain": false
-    }}
-  ]
-}}
-```
-
-**Example Output (Message is ONLY a guide, no specific project updates):**
-```json
-{{
-  "is_guide": true,
-  "guide_summary": "General guide on setting up a Metamask wallet.",
-  "primary_subject_project": null,
-  "identified_updates": []
-}}
-```
-
-**Example Output (Message contains ONLY updates, is NOT a guide):**
-```json
-{{
-  "is_guide": false,
-  "guide_summary": null,
-  "primary_subject_project": null,
-  "identified_updates": [
+      "project_name": "ZkSync",
+      "activity_type": "Protocol Update",
+      "summary": "Mainnet v2.4 upgrade has been launched.",
+      "needs_review": false,
+      "deadline_original_text": null,
+      "deadline_parsed": null
+    }},
     {{
-      "project_name": "Initia",
-      "activity_type": "Exchange Listing",
-      "summary": "INIT token listed on Bybit pre-market, price reached $0.70.",
-      "is_node_opportunity": false,
-      "key_links": ["https://www.bybit.com/trade/usdt/INITUSDT"],
-      "referral_links": [],
-      "deadline": null,
-      "required_actions_summary": null,
-      "is_uncertain": false
+      "project_name": "LayerZero",
+      "activity_type": "Airdrop Check",
+      "summary": "Airdrop eligibility checker is available.",
+      "needs_review": false,
+      "deadline_original_text": null,
+      "deadline_parsed": null
     }}
   ]
 }}
 ```
-"""
 
-    # 3. Call Gemini API with retry logic
+**Example 2 (Noise/Advertisement):**
+*Message:* "BTC looking weak, might drop to 50k. Altcoins bleeding. Check out my premium channel for alpha calls! DYOR. Maybe keep an eye on SOL."
+*Output:*
+```json
+{{
+  "identified_projects": [
+    {{
+      "project_name": "Market Analysis",
+      "activity_type": "Noise/Advertisement",
+      "summary": "General market commentary and channel promotion.",
+      "needs_review": false,
+      "deadline_original_text": null,
+      "deadline_parsed": null
+    }}
+  ]
+}}
+```
+
+**Example 3 (Quest with Deadline):**
+*Message:* "Complete the new Galxe quest for Project Neptune by tomorrow 8 PM CET to be eligible for rewards. Link in bio."
+*Output:*
+```json
+{{
+  "identified_projects": [
+    {{
+      "project_name": "Project Neptune",
+      "activity_type": "Quest/Task",
+      "summary": "New Galxe quest available for rewards.",
+      "needs_review": false,
+      "deadline_original_text": "by tomorrow 8 PM CET",
+      "deadline_parsed": "2024-10-27 20:00:00+01:00" // Example assuming 'today' is Oct 26, 2024, CET is UTC+1
+    }}
+  ]
+}}
+```
+**Example 4 (Vague Deadline - Null Parsed):**
+*Message:* "WenMoon token presale ending very soon! Get in now!"
+*Output:*
+```json
+{{
+  "identified_projects": [
+    {{
+      "project_name": "WenMoon",
+      "activity_type": "Token Sale/IDO",
+      "summary": "Token presale is ending soon.",
+      "needs_review": false,
+      "deadline_original_text": null, // "very soon" is too vague for original text
+      "deadline_parsed": null
+    }}
+  ]
+}}
+```
+
+**Message to Analyze:**
+```text
+{cleaned_message_text}
+```
+
+**Your JSON Output:**
+"""
+    prompt = prompt_template
+
+    # 3. Call Gemini API (Generation) - WITH RETRY
     max_retries = 3
     attempt = 0
     raw_response_text = None
@@ -309,42 +356,42 @@ Output ONLY a single JSON object containing the top-level `is_guide`, `guide_sum
         logging.info(f"Calling Gemini API (Attempt {attempt}/{max_retries}). Link: {message_link}")
         try:
             # Generate content using the model
-            response = model.generate_content(prompt_template)
-            raw_response_text = response.text
-            logging.debug(f"Raw Gemini response for {message_link}:\n{raw_response_text}")
+            response = model.generate_content(prompt)
+            # --- REMOVED DEBUGGING SECTION ---
+            llm_response_text = response.text
 
             # --- PARSING (Expecting main object with list and guide flags) ---
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_response_text, re.DOTALL | re.IGNORECASE)
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', llm_response_text, re.DOTALL | re.IGNORECASE)
             if json_match:
                 json_str = json_match.group(1).strip()
             else:
-                json_str = raw_response_text.strip()
+                json_str = llm_response_text.strip()
                 if not json_str.startswith('{') or not json_str.endswith('}'):
                     raise ValueError("Response does not appear to be a JSON object.")
 
             parsed_response = json.loads(json_str)
 
             # Validate structure
-            if not isinstance(parsed_response, dict) or 'identified_updates' not in parsed_response:
-                 # Allow for guide-only responses where identified_updates might be empty but is_guide is present
+            if not isinstance(parsed_response, dict) or 'identified_projects' not in parsed_response:
+                 # Allow for guide-only responses where identified_projects might be empty but is_guide is present
                  if not parsed_response.get('is_guide'):
-                     raise ValueError("Parsed JSON is not a dictionary or missing 'identified_updates' key (and not a guide).")
+                     raise ValueError("Parsed JSON is not a dictionary or missing 'identified_projects' key (and not a guide).")
                  else: # It's likely a guide-only response
-                     if 'identified_updates' not in parsed_response:
-                          parsed_response['identified_updates'] = [] # Ensure the list exists even if empty
+                     if 'identified_projects' not in parsed_response:
+                          parsed_response['identified_projects'] = [] # Ensure the list exists even if empty
 
-            if 'identified_updates' in parsed_response and not isinstance(parsed_response['identified_updates'], list):
-                 raise ValueError("'identified_updates' key does not contain a list.")
+            if 'identified_projects' in parsed_response and not isinstance(parsed_response['identified_projects'], list):
+                 raise ValueError("'identified_projects' key does not contain a list.")
 
-            logging.info(f"Successfully parsed Gemini response for {message_link}. Updates found: {len(parsed_response.get('identified_updates', []))}. Is Guide: {parsed_response.get('is_guide')}")
+            logging.info(f"Successfully parsed Gemini response for {message_link}. Updates found: {len(parsed_response.get('identified_projects', []))}. Is Guide: {parsed_response.get('is_guide')}")
             break # Exit retry loop on successful parse
 
         # --- EXCEPT BLOCKS --- (Handle errors during API call or parsing)
         except json.JSONDecodeError as json_err:
-            logging.error(f"ANALYZER_ERROR: Failed to parse JSON response from Gemini. Error: {json_err}. Link: {message_link}\nRaw Response:\n{raw_response_text}", exc_info=True)
+            logging.error(f"ANALYZER_ERROR: Failed to parse JSON response from Gemini. Error: {json_err}. Link: {message_link}\nRaw Response:\n{llm_response_text}", exc_info=True)
             return 0, False, f"JSON Parsing Error: {json_err}"
         except ValueError as val_err:
-             logging.error(f"ANALYZER_ERROR: Invalid JSON structure or missing fields. Error: {val_err}. Link: {message_link}\nRaw Response:\n{raw_response_text}", exc_info=True)
+             logging.error(f"ANALYZER_ERROR: Invalid JSON structure or missing fields. Error: {val_err}. Link: {message_link}\nRaw Response:\n{llm_response_text}", exc_info=True)
              return 0, False, f"Invalid Data Structure: {val_err}"
         except ResourceExhausted as rate_limit_err:
             logging.warning(f"ANALYZER_WARNING: Gemini API rate limit hit (Attempt {attempt}/{max_retries}). Waiting {GENERATION_RETRY_WAIT_SECONDS}s... Link: {message_link}")
@@ -361,7 +408,7 @@ Output ONLY a single JSON object containing the top-level `is_guide`, `guide_sum
          return 0, False, "Failed to get or parse valid data from AI after retries."
 
     # 4. Process and Save Each Identified Update
-    updates_list = parsed_response.get('identified_updates', [])
+    updates_list = parsed_response.get('identified_projects', [])
     saved_updates_count = 0
     save_errors = []
     iso_timestamp = convert_timestamp_to_iso(timestamp)
@@ -375,15 +422,76 @@ Output ONLY a single JSON object containing the top-level `is_guide`, `guide_sum
                 continue
 
             # Prepare payload for this specific update
-            final_payload = update_data # Start with AI output for this update
+            # Extract deadline fields first and remove them from the AI output dict
+            deadline_parsed_from_ai = update_data.pop('deadline_parsed', None)
+            deadline_original_from_ai = update_data.pop('deadline_original_text', None)
+
+            # Create a copy to avoid modifying the original dict in the list
+            final_payload = update_data.copy() 
+
+            # Add common fields
             final_payload['source_channel'] = channel
             final_payload['source_message_link'] = message_link
-            final_payload['message_timestamp'] = iso_timestamp
+            final_payload['message_timestamp'] = iso_timestamp # Assign the converted timestamp
             final_payload['full_message_text'] = cleaned_message_text
 
+            # Add the correctly named deadline fields for Supabase
+            final_payload['deadline'] = deadline_parsed_from_ai # Mapped to timestamptz column
+            final_payload['deadline_original_text'] = deadline_original_from_ai # Mapped to text column
+
             # Map AI uncertainty to 'needs_review' flag
-            is_uncertain = final_payload.pop('is_uncertain', False) # Get flag and remove from payload
+            is_uncertain = final_payload.pop('is_uncertain', False) # Get flag and remove from payload if it exists
             final_payload['needs_review'] = is_uncertain # Set DB flag based on AI output
+
+            # --- Generate Embedding ---
+            # Construct text including key_links
+            key_links = final_payload.get('key_links', [])
+            links_string = " Links: " + " ".join(key_links) if key_links else ""
+            embedding_text = f"Project: {final_payload.get('project_name', '')}, Activity: {final_payload.get('activity_type', '')}, Summary: {final_payload.get('summary', '')}{links_string}"
+            
+            embedding_vector = None # Initialize embedding vector
+            try:
+                # Using a standard text embedding model from Gemini
+                embedding_response = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=embedding_text,
+                    task_type="retrieval_document" # Appropriate for DB storage/similarity search
+                )
+                embedding_vector = embedding_response['embedding']
+                final_payload['embedding'] = embedding_vector
+                logging.debug(f"Generated embedding for project '{final_payload.get('project_name')}'.")
+            except Exception as emb_err:
+                logging.warning(f"Failed to generate embedding for project '{final_payload.get('project_name')}'. Error: {emb_err}")
+                final_payload['embedding'] = None # Ensure embedding is null on failure
+            # --- End Embedding Generation ---
+
+            # --- Real-time Duplicate Check --- 
+            final_payload['is_duplicate'] = False # Default to False
+            if embedding_vector and supabase: # Only check if embedding was successful and supabase is available
+                try:
+                    # Use a higher threshold for automated flagging
+                    duplicate_threshold = 0.92 
+                    match_count = 1 # We only need to know if at least one high-similarity match exists
+                    
+                    logging.debug(f"Checking for duplicates for project '{final_payload.get('project_name')}' (Threshold: {duplicate_threshold})")
+                    response = supabase.rpc('match_similar_updates', {
+                        'query_embedding': embedding_vector,
+                        'match_threshold': duplicate_threshold,
+                        'match_count': match_count,
+                        'exclude_id': None # Check against all existing records
+                    }).execute()
+
+                    if response.data: # If the RPC returned any matches above the threshold
+                        logging.info(f"Potential duplicate found for project '{final_payload.get('project_name')}'. Flagging record. Match details: {response.data[0]}")
+                        final_payload['is_duplicate'] = True
+                    elif hasattr(response, 'error') and response.error:
+                        logging.warning(f"Error during real-time duplicate check RPC call: {response.error}")
+                    else:
+                        logging.debug("No high-similarity duplicates found.")
+
+                except Exception as rpc_err:
+                    logging.warning(f"Exception during real-time duplicate check for project '{final_payload.get('project_name')}': {rpc_err}")
+            # --- End Real-time Duplicate Check ---
 
             # Save this individual update payload
             if save_to_supabase(final_payload):
@@ -409,7 +517,8 @@ Output ONLY a single JSON object containing the top-level `is_guide`, `guide_sum
              'is_node_opportunity': None, # Or False? Set to None for clarity
              'key_links': [], # Maybe parse links from guide summary later?
              'referral_links': [],
-             'deadline': None,
+             'deadline_original_text': None,
+             'deadline_parsed': None,
              'required_actions_summary': None,
              'source_channel': channel,
              'source_message_link': message_link, # Shares link with updates
@@ -418,6 +527,10 @@ Output ONLY a single JSON object containing the top-level `is_guide`, `guide_sum
              'needs_review': False # Assume guide identification is reliable
              # Add other relevant fields if needed, ensure they default/are nullable
          }
+         # Ensure the deadline fields for the guide are correctly named
+         guide_payload['deadline'] = None # Parsed deadline is likely null for guides
+         guide_payload['deadline_original_text'] = None # Original text is likely null too
+
          if save_to_supabase(guide_payload):
              logging.info(f"Successfully saved guide entry for project: {primary_subject_project or 'Generic'}. Link: {message_link}")
              guide_saved_flag = True

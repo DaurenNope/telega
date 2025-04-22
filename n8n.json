@@ -1,0 +1,325 @@
+{
+    "name": "Supabase to Notion Integration",
+    "nodes": [
+      {
+        "parameters": {
+          "triggerTimes": {
+            "item": [
+              {
+                "mode": "everyMinute"
+              }
+            ]
+          }
+        },
+        "id": "9b4ff1e0-d0c9-4518-a08c-c4bc40f9c6a8",
+        "name": "Schedule Trigger",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1,
+        "position": [
+          240,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "postgresql",
+          "schema": "public",
+          "table": "telegram_project_updates",
+          "options": {
+            "mode": "lastTimeChecked",
+            "column": "created_at"
+          }
+        },
+        "id": "c4b9e3a2-f4d1-4e05-9d9b-3d30fc76c7a8",
+        "name": "Postgres",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 1,
+        "position": [
+          460,
+          300
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "postgres-credentials-id",
+            "name": "Postgres Supabase Credentials"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$json[\"is_duplicate\"]}}",
+                "value2": false
+              }
+            ]
+          }
+        },
+        "id": "c8b5e1a2-5b6c-11eb-ae93-0242ac130002",
+        "name": "Filter Duplicates",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 1,
+        "position": [
+          680,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "oAuth2",
+          "resource": "database",
+          "operation": "search",
+          "databaseId": "{{$node[\"Notion Credentials\"].json[\"projects_master_db_id\"]}}",
+          "filterType": "custom",
+          "filterJson": "{\n  \"property\": \"Name\",\n  \"title\": {\n    \"equals\": \"{{$json[\"project_name\"]}}\"\n  }\n}"
+        },
+        "id": "4d7a8f60-5b6c-11eb-ae93-0242ac130002",
+        "name": "Notion Project Search",
+        "type": "n8n-nodes-base.notion",
+        "typeVersion": 1,
+        "position": [
+          900,
+          240
+        ],
+        "credentials": {
+          "notionOAuth2Api": {
+            "id": "notion-credentials-id",
+            "name": "Notion Credentials"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "authentication": "oAuth2",
+          "resource": "databasePage",
+          "operation": "getAll",
+          "databaseId": "{{$node[\"Notion Credentials\"].json[\"projects_master_db_id\"]}}",
+          "limit": 1
+        },
+        "id": "5d7a8f60-5b6c-11eb-ae93-0242ac130003",
+        "name": "Notion Credentials",
+        "type": "n8n-nodes-base.notion",
+        "typeVersion": 1,
+        "position": [
+          240,
+          480
+        ],
+        "credentials": {
+          "notionOAuth2Api": {
+            "id": "notion-credentials-id",
+            "name": "Notion Credentials"
+          }
+        },
+        "alwaysOutputData": true
+      },
+      {
+        "parameters": {
+          "jsCode": "// Process the search results\nconst searchResults = $input.item(0)?.json?.results || [];\n\n// Check if we found a matching project\nlet projectRelation = [];\nif (searchResults.length > 0) {\n  projectRelation = [{ \"id\": searchResults[0].id }];\n}\n\n// Format the key links and referral links\nlet keyLinks = $input.item(1)?.json?.key_links || [];\nlet referralLinks = $input.item(1)?.json?.referral_links || [];\n\n// Handle different data types for links (array or JSON)\nif (typeof keyLinks === 'string') {\n  try {\n    keyLinks = JSON.parse(keyLinks);\n  } catch (e) {\n    keyLinks = [keyLinks];\n  }\n}\n\nif (typeof referralLinks === 'string') {\n  try {\n    referralLinks = JSON.parse(referralLinks);\n  } catch (e) {\n    referralLinks = [referralLinks];\n  }\n}\n\n// Format links as text with line breaks\nconst formattedKeyLinks = keyLinks.join('\\n');\nconst formattedReferralLinks = referralLinks.join('\\n');\n\n// Return the processed data\nreturn {\n  json: {\n    projectRelation,\n    formattedKeyLinks,\n    formattedReferralLinks,\n    telegramData: $input.item(1)?.json\n  }\n};"
+        },
+        "id": "8d7a8f60-5b6c-11eb-ae93-0242ac130002",
+        "name": "Process Data",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 1,
+        "position": [
+          1140,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "oAuth2",
+          "resource": "databasePage",
+          "databaseId": "{{$node[\"Notion Credentials\"].json[\"telegram_review_db_id\"]}}",
+          "title": "{{$node[\"Process Data\"].json[\"telegramData\"][\"summary\"]}}",
+          "propertiesUi": {
+            "propertyValues": [
+              {
+                "key": "Project",
+                "type": "relation",
+                "valueJson": "{{JSON.stringify($node[\"Process Data\"].json[\"projectRelation\"])}}"
+              },
+              {
+                "key": "Activity Type",
+                "type": "select",
+                "valueJson": "{\"name\": \"{{$node[\"Process Data\"].json[\"telegramData\"][\"activity_type\"]}}\"}",
+                "selects": []
+              },
+              {
+                "key": "Source Link",
+                "type": "url",
+                "value": "{{$node[\"Process Data\"].json[\"telegramData\"][\"source_message_link\"]}}"
+              },
+              {
+                "key": "Timestamp",
+                "type": "date",
+                "valueJson": "{\"start\": \"{{$node[\"Process Data\"].json[\"telegramData\"][\"message_timestamp\"]}}\", \"time_zone\": \"UTC\"}"
+              },
+              {
+                "key": "Review Status",
+                "type": "select",
+                "valueJson": "{\"name\": \"New\"}"
+              },
+              {
+                "key": "Key Links",
+                "type": "richText",
+                "valueJson": "[{\"text\": {\"content\": \"{{$node[\"Process Data\"].json[\"formattedKeyLinks\"]}}\"}}]"
+              },
+              {
+                "key": "Referral Links",
+                "type": "richText",
+                "valueJson": "[{\"text\": {\"content\": \"{{$node[\"Process Data\"].json[\"formattedReferralLinks\"]}}\"}}]"
+              },
+              {
+                "key": "Full Message Text",
+                "type": "richText",
+                "valueJson": "[{\"text\": {\"content\": \"{{$node[\"Process Data\"].json[\"telegramData\"][\"full_message_text\"].replace(/\"/g, '\\\\\"').replace(/\\n/g, '\\\\n')}}\"}}]"
+              },
+              {
+                "key": "Needs Review",
+                "type": "checkbox",
+                "value": "{{$node[\"Process Data\"].json[\"telegramData\"][\"needs_review\"]}}"
+              },
+              {
+                "key": "Supabase ID",
+                "type": "richText",
+                "valueJson": "[{\"text\": {\"content\": \"{{$node[\"Process Data\"].json[\"telegramData\"][\"id\"]}}\"}}]"
+              }
+            ]
+          }
+        },
+        "id": "b5c9e3a2-f4d1-4e05-9d9b-3d30fc76c7a8",
+        "name": "Create Notion Page",
+        "type": "n8n-nodes-base.notion",
+        "typeVersion": 1,
+        "position": [
+          1380,
+          300
+        ],
+        "credentials": {
+          "notionOAuth2Api": {
+            "id": "notion-credentials-id",
+            "name": "Notion Credentials"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "content": "# Error in Supabase to Notion Integration\n\nThere was an error while creating a new record in Notion:\n\n**Error Message:** {{$node[\"Create Notion Page\"].error.message}}\n\n**Supabase Record ID:** {{$json[\"id\"]}}\n\n**Project Name:** {{$json[\"project_name\"]}}\n\n**Timestamp:** {{$now}}",
+          "to": "your-email@example.com",
+          "subject": "Error in Supabase to Notion Integration",
+          "options": {}
+        },
+        "id": "f4b9e3a2-f4d1-4e05-9d9b-3d30fc76c7a8",
+        "name": "Error Notification",
+        "type": "n8n-nodes-base.emailSend",
+        "typeVersion": 1,
+        "position": [
+          1380,
+          480
+        ],
+        "credentials": {
+          "smtp": {
+            "id": "smtp-credentials-id",
+            "name": "SMTP Credentials"
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Schedule Trigger": {
+        "main": [
+          [
+            {
+              "node": "Postgres",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Postgres": {
+        "main": [
+          [
+            {
+              "node": "Filter Duplicates",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Filter Duplicates": {
+        "main": [
+          [
+            {
+              "node": "Notion Project Search",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Notion Project Search": {
+        "main": [
+          [
+            {
+              "node": "Process Data",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Process Data": {
+        "main": [
+          [
+            {
+              "node": "Create Notion Page",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Create Notion Page": {
+        "error": [
+          [
+            {
+              "node": "Error Notification",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {
+      "Notion Credentials": [
+        {
+          "json": {
+            "projects_master_db_id": "YOUR_PROJECTS_MASTER_DATABASE_ID",
+            "telegram_review_db_id": "YOUR_TELEGRAM_REVIEW_DATABASE_ID"
+          }
+        }
+      ]
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "saveManualExecutions": true,
+      "callerPolicy": "workflowsFromSameOwner",
+      "errorWorkflow": "",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "saveExecutionProgress": true
+    },
+    "staticData": null,
+    "tags": [
+      "supabase",
+      "notion",
+      "integration"
+    ],
+    "triggerCount": 1,
+    "versionId": "84c0e8e0-5b6c-11eb-ae93-0242ac130002"
+  }
